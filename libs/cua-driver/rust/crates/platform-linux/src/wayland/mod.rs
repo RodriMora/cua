@@ -3055,14 +3055,30 @@ pub fn inject_drag(
     }])
 }
 
-fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
-    let mut windows = crate::atspi::list_windows(filter_pid);
+#[derive(Clone, Debug)]
+struct WaylandAtspiCandidate {
+    window: WindowInfo,
+    // The window id and geometry came from a compositor-owned adapter, not
+    // only AT-SPI. Only these candidates may replace a foreign-toplevel
+    // protocol id in a public exact-target row.
+    compositor_attested: bool,
+}
+
+fn wayland_atspi_candidates(filter_pid: Option<u32>) -> Vec<WaylandAtspiCandidate> {
+    let mut candidates = crate::atspi::list_windows(filter_pid)
+        .into_iter()
+        .map(|window| WaylandAtspiCandidate {
+            window,
+            compositor_attested: false,
+        })
+        .collect::<Vec<_>>();
     // AT-SPI can retain a toolkit's default placement (commonly 120,120)
     // after a compositor has placed the real toplevel elsewhere. Reconcile the
     // fallback records with compositor-owned metadata before exposing them to
     // callers; element bounds use these same authoritative origins.
     let hyprland_windows = hyprland::list_windows().unwrap_or_default();
-    for window in &mut windows {
+    for candidate in &mut candidates {
+        let window = &mut candidate.window;
         let hyprland = window.pid.and_then(|pid| {
             hyprland::matching_window(&hyprland_windows, pid, &window.title, &window.app_name)
         });
@@ -3073,6 +3089,7 @@ fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
             window.width = hyprland.width;
             window.height = hyprland.height;
             window.is_on_screen = hyprland.visible && hyprland.width > 0 && hyprland.height > 0;
+            candidate.compositor_attested = true;
             continue;
         }
 
@@ -3088,10 +3105,12 @@ fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
             window.width = sway.width;
             window.height = sway.height;
             window.is_on_screen = sway.visible && sway.width > 0 && sway.height > 0;
+            candidate.compositor_attested = true;
         }
     }
     if is_inject_mode() {
-        for window in &mut windows {
+        for candidate in &mut candidates {
+            let window = &mut candidate.window;
             if let Some(pid) = window.pid {
                 if let Some((window_x, window_y)) = inject_window_origin(pid) {
                     window.x = window_x;
@@ -3100,7 +3119,14 @@ fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
             }
         }
     }
-    windows
+    candidates
+}
+
+fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
+    wayland_atspi_candidates(filter_pid)
+        .into_iter()
+        .map(|candidate| candidate.window)
+        .collect()
 }
 
 /// Window-enumeration dispatcher: native Wayland when available, else X11.
@@ -3110,11 +3136,10 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
         // only consulted when wlroots yields no windows (including when its
         // manager global is absent).
         let native = match list_windows() {
-            Ok(ws) if !ws.is_empty() => Ok(enrich_native_windows(
-                ws,
-                wayland_atspi_windows(filter_pid),
-                is_inject_mode(),
-            )),
+            Ok(ws) if !ws.is_empty() => {
+                let atspi = wayland_atspi_candidates(filter_pid);
+                Ok(enrich_native_windows(ws, atspi, is_inject_mode()))
+            }
             Ok(_) => ext_toplevel::list_windows(),
             Err(wlr_error) => ext_toplevel::list_windows().map_err(|ext_error| {
                 anyhow::anyhow!(
@@ -3206,7 +3231,7 @@ fn merge_atspi_windows(
 
 fn enrich_native_windows(
     mut native: Vec<WindowInfo>,
-    atspi: Vec<WindowInfo>,
+    atspi: Vec<WaylandAtspiCandidate>,
     adopt_atspi_ids: bool,
 ) -> Vec<WindowInfo> {
     let mut claimed = std::collections::HashSet::new();
@@ -3218,7 +3243,7 @@ fn enrich_native_windows(
         let title_match = atspi.iter().enumerate().find_map(|(index, candidate)| {
             (!claimed.contains(&index)
                 && !native_title.is_empty()
-                && candidate.title == native_title)
+                && candidate.window.title == native_title)
                 .then_some(index)
         });
         let app_match = title_match.or_else(|| {
@@ -3228,7 +3253,7 @@ fn enrich_native_windows(
                 .filter(|(index, candidate)| {
                     !claimed.contains(index)
                         && !window.app_name.is_empty()
-                        && candidate.app_name == window.app_name
+                        && candidate.window.app_name == window.app_name
                 })
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();
@@ -3237,31 +3262,32 @@ fn enrich_native_windows(
         let Some(index) = app_match else { continue };
         claimed.insert(index);
         let candidate = &atspi[index];
-        window.pid = candidate.pid;
-        if adopt_atspi_ids {
+        let candidate_window = &candidate.window;
+        window.pid = candidate_window.pid;
+        if candidate.compositor_attested || adopt_atspi_ids {
             let toplevel = Toplevel {
                 title: undecorated_native_title(window).to_owned(),
                 app_id: window.app_name.clone(),
                 closed: false,
             };
-            window.xid = candidate.xid;
+            window.xid = candidate_window.xid;
             remember_identity(window.xid, &toplevel);
         }
         if window.width == 0 || window.height == 0 {
-            window.x = candidate.x;
-            window.y = candidate.y;
-            window.width = candidate.width;
-            window.height = candidate.height;
+            window.x = candidate_window.x;
+            window.y = candidate_window.y;
+            window.width = candidate_window.width;
+            window.height = candidate_window.height;
         }
         if adopt_atspi_ids {
-            if let Some(pid) = candidate.pid {
+            if let Some(pid) = candidate_window.pid {
                 if let Some((window_x, window_y)) = inject_window_origin(pid) {
                     window.x = window_x;
                     window.y = window_y;
                 }
             }
         }
-        window.is_on_screen = candidate.is_on_screen;
+        window.is_on_screen = candidate_window.is_on_screen;
     }
     native
 }
@@ -3398,6 +3424,20 @@ mod tests {
         }
     }
 
+    fn atspi_candidate(window: WindowInfo) -> WaylandAtspiCandidate {
+        WaylandAtspiCandidate {
+            window,
+            compositor_attested: false,
+        }
+    }
+
+    fn compositor_candidate(window: WindowInfo) -> WaylandAtspiCandidate {
+        WaylandAtspiCandidate {
+            window,
+            compositor_attested: true,
+        }
+    }
+
     #[test]
     fn atspi_merge_keeps_x11_geometry_owner_and_native_only_frames() {
         let mut windows = vec![window(10, Some(100), "XWayland")];
@@ -3440,7 +3480,8 @@ mod tests {
         accessible.width = 800;
         accessible.height = 600;
 
-        let enriched = enrich_native_windows(vec![native], vec![accessible], false);
+        let enriched =
+            enrich_native_windows(vec![native], vec![atspi_candidate(accessible)], false);
 
         assert_eq!(enriched[0].xid, 42);
         assert_eq!(enriched[0].pid, Some(123));
@@ -3462,7 +3503,7 @@ mod tests {
         accessible.y = 30;
         accessible.width = 800;
         accessible.height = 600;
-        let enriched = enrich_native_windows(native, vec![accessible], false);
+        let enriched = enrich_native_windows(native, vec![atspi_candidate(accessible)], false);
         assert_eq!(enriched[0].xid, 77);
         assert_eq!(enriched[0].pid, Some(123));
         assert_eq!(
@@ -3480,12 +3521,43 @@ mod tests {
     fn nested_enrichment_adopts_stable_atspi_id() {
         let native = vec![window(77, None, "CuaTestHarness")];
         let accessible = window(123 << 16, Some(123), "CuaTestHarness");
-        let enriched = enrich_native_windows(native, vec![accessible], true);
+        let enriched = enrich_native_windows(native, vec![atspi_candidate(accessible)], true);
         assert_eq!(enriched[0].xid, 123 << 16);
         assert_eq!(enriched[0].pid, Some(123));
         assert_eq!(
             identity_for(enriched[0].xid).unwrap().title,
             "CuaTestHarness"
+        );
+    }
+
+    #[test]
+    fn native_list_row_adopts_verified_compositor_identity_outside_inject_mode() {
+        let mut native = window(0xff00_0000, None, "about:blank - Chromium [chromium]");
+        native.app_name = "chromium".into();
+        let native = vec![native];
+        let mut compositor = window(0x5be0_8000_0, Some(376_328), "about:blank - Chromium");
+        compositor.app_name = "chromium".into();
+        compositor.x = 1287;
+        compositor.y = 42;
+        compositor.width = 1235;
+        compositor.height = 1386;
+
+        let enriched = enrich_native_windows(native, vec![compositor_candidate(compositor)], false);
+
+        assert_eq!(enriched[0].xid, 0x5be0_8000_0);
+        assert_eq!(enriched[0].pid, Some(376_328));
+        assert_eq!(
+            (
+                enriched[0].x,
+                enriched[0].y,
+                enriched[0].width,
+                enriched[0].height
+            ),
+            (1287, 42, 1235, 1386)
+        );
+        assert_eq!(
+            identity_for(enriched[0].xid).unwrap().title,
+            "about:blank - Chromium"
         );
     }
 
